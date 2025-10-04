@@ -122,13 +122,13 @@ function PlayPageClient() {
     blockAdEnabledRef.current = blockAdEnabled;
   }, [blockAdEnabled]);
 
-  // 外部弹幕开关（从 localStorage 继承，默认 true）
+  // 外部弹幕开关（从 localStorage 继承，默认全部关闭）
   const [externalDanmuEnabled, setExternalDanmuEnabled] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
       const v = localStorage.getItem('enable_external_danmu');
       if (v !== null) return v === 'true';
     }
-    return true; // 默认开启外部弹幕
+    return false; // 默认关闭外部弹幕
   });
   const externalDanmuEnabledRef = useRef(externalDanmuEnabled);
   useEffect(() => {
@@ -375,11 +375,18 @@ function PlayPageClient() {
   // 弹幕加载状态管理，防止重复加载
   const danmuLoadingRef = useRef<boolean>(false);
   const lastDanmuLoadKeyRef = useRef<string>('');
-  
+
   // 🚀 新增：弹幕操作防抖和性能优化
   const danmuOperationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const episodeSwitchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const danmuPluginStateRef = useRef<any>(null); // 保存弹幕插件状态
+  const isSourceChangingRef = useRef<boolean>(false); // 标记是否正在换源
+  const isEpisodeChangingRef = useRef<boolean>(false); // 标记是否正在切换集数
+
+  // 🚀 新增：连续切换源防抖和资源管理
+  const sourceSwitchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingSwitchRef = useRef<any>(null); // 保存待处理的切换请求
+  const switchPromiseRef = useRef<Promise<void> | null>(null); // 当前切换的Promise
 
   const artPlayerRef = useRef<any>(null);
   const artRef = useRef<HTMLDivElement | null>(null);
@@ -391,9 +398,10 @@ function PlayPageClient() {
   // 工具函数（Utils）
   // -----------------------------------------------------------------------------
 
-  // bangumi ID检测（6位数字）
+  // bangumi ID检测（3-6位数字）
   const isBangumiId = (id: number): boolean => {
-    return id > 0 && id.toString().length === 6;
+    const length = id.toString().length;
+    return id > 0 && length >= 3 && length <= 6;
   };
 
   // bangumi缓存配置
@@ -486,31 +494,41 @@ function PlayPageClient() {
   const generateSearchVariants = (originalQuery: string): string[] => {
     const variants: string[] = [];
     const trimmed = originalQuery.trim();
-    
+
     // 1. 原始查询（最高优先级）
     variants.push(trimmed);
-    
+
+    // 2. 处理中文标点符号变体
+    const chinesePunctuationVariants = generateChinesePunctuationVariants(trimmed);
+    chinesePunctuationVariants.forEach(variant => {
+      if (!variants.includes(variant)) {
+        variants.push(variant);
+      }
+    });
+
+    // 3. 移除数字变体处理（优化性能，依赖downstream相关性评分处理数字差异）
+
     // 如果包含空格，生成额外变体
     if (trimmed.includes(' ')) {
-      // 2. 去除所有空格
+      // 4. 去除所有空格
       const noSpaces = trimmed.replace(/\s+/g, '');
       if (noSpaces !== trimmed) {
         variants.push(noSpaces);
       }
-      
-      // 3. 标准化空格（多个空格合并为一个）
+
+      // 5. 标准化空格（多个空格合并为一个）
       const normalizedSpaces = trimmed.replace(/\s+/g, ' ');
       if (normalizedSpaces !== trimmed && !variants.includes(normalizedSpaces)) {
         variants.push(normalizedSpaces);
       }
-      
-      // 4. 提取关键词组合（针对"中餐厅 第九季"这种情况）
+
+      // 6. 提取关键词组合（针对"中餐厅 第九季"这种情况）
       const keywords = trimmed.split(/\s+/);
       if (keywords.length >= 2) {
         // 主要关键词 + 季/集等后缀
         const mainKeyword = keywords[0];
         const lastKeyword = keywords[keywords.length - 1];
-        
+
         // 如果最后一个词包含"第"、"季"、"集"等，尝试组合
         if (/第|季|集|部|篇|章/.test(lastKeyword)) {
           const combined = mainKeyword + lastKeyword;
@@ -518,16 +536,115 @@ function PlayPageClient() {
             variants.push(combined);
           }
         }
-        
-        // 仅使用主关键词搜索
-        if (!variants.includes(mainKeyword)) {
+
+        // 7. 空格变冒号的变体（重要！针对"死神来了 血脉诅咒" -> "死神来了：血脉诅咒"）
+        const withColon = trimmed.replace(/\s+/g, '：');
+        if (!variants.includes(withColon)) {
+          variants.push(withColon);
+        }
+
+        // 8. 空格变英文冒号的变体
+        const withEnglishColon = trimmed.replace(/\s+/g, ':');
+        if (!variants.includes(withEnglishColon)) {
+          variants.push(withEnglishColon);
+        }
+
+        // 仅使用主关键词搜索（过滤无意义的词）
+        const meaninglessWords = ['the', 'a', 'an', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by'];
+        if (!variants.includes(mainKeyword) &&
+            !meaninglessWords.includes(mainKeyword.toLowerCase()) &&
+            mainKeyword.length > 2) {
           variants.push(mainKeyword);
         }
       }
     }
-    
+
     // 去重并返回
     return Array.from(new Set(variants));
+  };
+
+  // 移除数字变体生成函数（优化性能，依赖相关性评分处理）
+
+  /**
+   * 生成中文标点符号的搜索变体
+   * @param query 原始查询
+   * @returns 标点符号变体数组
+   */
+  const generateChinesePunctuationVariants = (query: string): string[] => {
+    const variants: string[] = [];
+
+    // 检查是否包含中文标点符号
+    const chinesePunctuation = /[：；，。！？、""''（）【】《》]/;
+    if (!chinesePunctuation.test(query)) {
+      return variants;
+    }
+
+    // 中文冒号变体 (针对"死神来了：血脉诅咒"这种情况)
+    if (query.includes('：')) {
+      // 优先级1: 替换为空格 (最可能匹配，如"死神来了 血脉诅咒" 能匹配到 "死神来了6：血脉诅咒")
+      const withSpace = query.replace(/：/g, ' ');
+      variants.push(withSpace);
+
+      // 优先级2: 完全去除冒号
+      const noColon = query.replace(/：/g, '');
+      variants.push(noColon);
+
+      // 优先级3: 替换为英文冒号
+      const englishColon = query.replace(/：/g, ':');
+      variants.push(englishColon);
+
+      // 优先级4: 提取冒号前的主标题 (降低优先级，避免匹配到错误的系列)
+      const beforeColon = query.split('：')[0].trim();
+      if (beforeColon && beforeColon !== query) {
+        variants.push(beforeColon);
+      }
+
+      // 优先级5: 提取冒号后的副标题
+      const afterColon = query.split('：')[1]?.trim();
+      if (afterColon) {
+        variants.push(afterColon);
+      }
+    }
+
+    // 其他中文标点符号处理
+    let cleanedQuery = query;
+
+    // 替换中文标点为对应英文标点
+    cleanedQuery = cleanedQuery.replace(/；/g, ';');
+    cleanedQuery = cleanedQuery.replace(/，/g, ',');
+    cleanedQuery = cleanedQuery.replace(/。/g, '.');
+    cleanedQuery = cleanedQuery.replace(/！/g, '!');
+    cleanedQuery = cleanedQuery.replace(/？/g, '?');
+    cleanedQuery = cleanedQuery.replace(/"/g, '"');
+    cleanedQuery = cleanedQuery.replace(/"/g, '"');
+    cleanedQuery = cleanedQuery.replace(/'/g, "'");
+    cleanedQuery = cleanedQuery.replace(/'/g, "'");
+    cleanedQuery = cleanedQuery.replace(/（/g, '(');
+    cleanedQuery = cleanedQuery.replace(/）/g, ')');
+    cleanedQuery = cleanedQuery.replace(/【/g, '[');
+    cleanedQuery = cleanedQuery.replace(/】/g, ']');
+    cleanedQuery = cleanedQuery.replace(/《/g, '<');
+    cleanedQuery = cleanedQuery.replace(/》/g, '>');
+
+    if (cleanedQuery !== query) {
+      variants.push(cleanedQuery);
+    }
+
+    // 完全去除所有标点符号
+    const noPunctuation = query.replace(/[：；，。！？、""''（）【】《》:;,.!?"'()[\]<>]/g, '');
+    if (noPunctuation !== query && noPunctuation.trim()) {
+      variants.push(noPunctuation);
+    }
+
+    return variants;
+  };
+
+  // 检查是否包含查询中的所有关键词（与downstream评分逻辑保持一致）
+  const checkAllKeywordsMatch = (queryTitle: string, resultTitle: string): boolean => {
+    const queryWords = queryTitle.replace(/[^\w\s\u4e00-\u9fff]/g, '').split(/\s+/).filter(w => w.length > 0);
+
+    // 检查结果标题是否包含查询中的所有关键词
+    return queryWords.every(word => resultTitle.includes(word));
   };
 
   // 网盘搜索函数
@@ -1277,7 +1394,7 @@ function PlayPageClient() {
           } else {
             // 关闭弹幕：立即处理
             console.log('🚀 优化后关闭外部弹幕...');
-            plugin.load([]);
+            plugin.load(); // 不传参数，真正清空弹幕
             plugin.hide();
             console.log('✅ 外部弹幕已关闭');
             
@@ -1306,13 +1423,34 @@ function PlayPageClient() {
     const currentEpisodeNum = currentEpisodeIndex + 1;
     const requestKey = `${currentVideoTitle}_${currentVideoYear}_${currentVideoDoubanId}_${currentEpisodeNum}`;
     
-    // 防止重复加载相同内容
-    if (danmuLoadingRef.current || lastDanmuLoadKeyRef.current === requestKey) {
-      console.log('弹幕正在加载中或内容未变化，跳过本次请求');
+    // 🚀 优化加载状态检测：更智能的卡住检测
+    const now = Date.now();
+    const loadingState = danmuLoadingRef.current as any;
+    const lastLoadTime = loadingState?.timestamp || 0;
+    const lastRequestKey = loadingState?.requestKey || '';
+    const isStuckLoad = now - lastLoadTime > 15000; // 降低到15秒超时
+    const isSameRequest = lastRequestKey === requestKey;
+
+    // 智能重复检测：区分真正的重复和卡住的请求
+    if (loadingState?.loading && isSameRequest && !isStuckLoad) {
+      console.log('⏳ 弹幕正在加载中，跳过重复请求');
       return [];
     }
-    
-    danmuLoadingRef.current = true;
+
+    // 强制重置卡住的加载状态
+    if (isStuckLoad && loadingState?.loading) {
+      console.warn('🔧 检测到弹幕加载超时，强制重置 (15秒)');
+      danmuLoadingRef.current = false;
+    }
+
+    // 设置新的加载状态，包含更多上下文信息
+    danmuLoadingRef.current = {
+      loading: true,
+      timestamp: now,
+      requestKey,
+      source: currentSource,
+      episode: currentEpisodeNum
+    } as any;
     lastDanmuLoadKeyRef.current = requestKey;
     
     try {
@@ -1412,20 +1550,39 @@ function PlayPageClient() {
 
   // 🚀 优化的集数变化处理（防抖 + 状态保护）
   useEffect(() => {
+    // 🔥 标记正在切换集数（只在非换源时）
+    if (!isSourceChangingRef.current) {
+      isEpisodeChangingRef.current = true;
+      console.log('🔄 开始切换集数，标记为集数变化');
+    }
+
     updateVideoUrl(detail, currentEpisodeIndex);
-    
-    // 重置弹幕加载标识，允许新集数加载弹幕
+
+    // 🚀 如果正在换源，跳过弹幕处理（换源会在完成后手动处理）
+    if (isSourceChangingRef.current) {
+      console.log('⏭️ 正在换源，跳过弹幕处理');
+      return;
+    }
+
+    // 🔥 关键修复：重置弹幕加载标识，确保新集数能正确加载弹幕
     lastDanmuLoadKeyRef.current = '';
-    
+    danmuLoadingRef.current = false; // 重置加载状态
+
     // 清除之前的集数切换定时器，防止重复执行
     if (episodeSwitchTimeoutRef.current) {
       clearTimeout(episodeSwitchTimeoutRef.current);
     }
-    
+
     // 如果播放器已经存在且弹幕插件已加载，重新加载弹幕
     if (artPlayerRef.current && artPlayerRef.current.plugins?.artplayerPluginDanmuku) {
       console.log('🚀 集数变化，优化后重新加载弹幕');
-      
+
+      // 🔥 关键修复：立即清空当前弹幕，避免旧弹幕残留
+      const plugin = artPlayerRef.current.plugins.artplayerPluginDanmuku;
+      plugin.reset(); // 立即回收所有正在显示的弹幕DOM
+      plugin.load(); // 不传参数，完全清空弹幕队列
+      console.log('🧹 已清空旧弹幕数据');
+
       // 保存当前弹幕插件状态
       danmuPluginStateRef.current = {
         isHide: artPlayerRef.current.plugins.artplayerPluginDanmuku.isHide,
@@ -1465,7 +1622,8 @@ function PlayPageClient() {
               }
             } else {
               console.log('📭 集数变化后没有弹幕数据可加载');
-              // 不自动清空，保持用户体验
+              plugin.load(); // 不传参数，确保清空弹幕
+
               if (artPlayerRef.current) {
                 artPlayerRef.current.notice.show = '暂无弹幕数据';
               }
@@ -1524,10 +1682,10 @@ function PlayPageClient() {
         const allResults: SearchResult[] = [];
         let bestResults: SearchResult[] = [];
         
-        // 依次尝试每个搜索变体
+        // 依次尝试每个搜索变体，采用早期退出策略
         for (const variant of searchVariants) {
           console.log('尝试搜索变体:', variant);
-          
+
           const response = await fetch(
             `/api/search?q=${encodeURIComponent(variant)}`
           );
@@ -1536,15 +1694,26 @@ function PlayPageClient() {
             continue;
           }
           const data = await response.json();
-          
+
           if (data.results && data.results.length > 0) {
             allResults.push(...data.results);
-            
-            // 处理搜索结果，根据规则过滤
+
+            // 移除早期退出策略，让downstream的相关性评分发挥作用
+
+            // 处理搜索结果，使用智能模糊匹配（与downstream评分逻辑保持一致）
             const filteredResults = data.results.filter(
               (result: SearchResult) => {
-                const titleMatch = result.title.replaceAll(' ', '').toLowerCase() ===
-                  videoTitleRef.current.replaceAll(' ', '').toLowerCase();
+                const queryTitle = videoTitleRef.current.replaceAll(' ', '').toLowerCase();
+                const resultTitle = result.title.replaceAll(' ', '').toLowerCase();
+
+                // 智能标题匹配：支持数字变体和标点符号变化
+                const titleMatch = resultTitle.includes(queryTitle) ||
+                  queryTitle.includes(resultTitle) ||
+                  // 移除数字和标点后匹配（针对"死神来了：血脉诅咒" vs "死神来了6：血脉诅咒"）
+                  resultTitle.replace(/\d+|[：:]/g, '') === queryTitle.replace(/\d+|[：:]/g, '') ||
+                  // 通用关键词匹配：检查是否包含查询中的所有关键词
+                  checkAllKeywordsMatch(queryTitle, resultTitle);
+
                 const yearMatch = videoYearRef.current
                   ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
                   : true;
@@ -1552,25 +1721,105 @@ function PlayPageClient() {
                   ? (searchType === 'tv' && result.episodes.length > 1) ||
                     (searchType === 'movie' && result.episodes.length === 1)
                   : true;
-                
+
                 return titleMatch && yearMatch && typeMatch;
               }
             );
-            
+
             if (filteredResults.length > 0) {
-              console.log(`变体 "${variant}" 找到 ${filteredResults.length} 个匹配结果`);
+              console.log(`变体 "${variant}" 找到 ${filteredResults.length} 个精确匹配结果`);
               bestResults = filteredResults;
               break; // 找到精确匹配就停止
             }
           }
         }
         
-        // 如果没有精确匹配，返回所有结果让用户选择
-        const finalResults = bestResults.length > 0 ? bestResults : 
-          // 去重所有结果
-          Array.from(
-            new Map(allResults.map(item => [`${item.source}-${item.id}`, item])).values()
-          );
+        // 智能匹配：英文标题严格匹配，中文标题宽松匹配
+        let finalResults = bestResults;
+
+        // 如果没有精确匹配，根据语言类型进行不同策略的匹配
+        if (bestResults.length === 0) {
+          const queryTitle = videoTitleRef.current.toLowerCase().trim();
+          const allCandidates = allResults;
+
+          // 检测查询主要语言（英文 vs 中文）
+          const englishChars = (queryTitle.match(/[a-z\s]/g) || []).length;
+          const chineseChars = (queryTitle.match(/[\u4e00-\u9fff]/g) || []).length;
+          const isEnglishQuery = englishChars > chineseChars;
+
+          console.log(`搜索语言检测: ${isEnglishQuery ? '英文' : '中文'} - "${queryTitle}"`);
+
+          let relevantMatches;
+
+          if (isEnglishQuery) {
+            // 英文查询：使用词汇匹配策略，避免不相关结果
+            console.log('使用英文词汇匹配策略');
+
+            // 提取有效英文词汇（过滤停用词）
+            const queryWords = queryTitle.toLowerCase()
+              .replace(/[^\w\s]/g, ' ')
+              .split(/\s+/)
+              .filter(word => word.length > 2 && !['the', 'a', 'an', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by'].includes(word));
+
+            console.log('英文关键词:', queryWords);
+
+            relevantMatches = allCandidates.filter(result => {
+              const title = result.title.toLowerCase();
+              const titleWords = title.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(word => word.length > 1);
+
+              // 计算词汇匹配度：标题必须包含至少50%的查询关键词
+              const matchedWords = queryWords.filter(queryWord =>
+                titleWords.some(titleWord =>
+                  titleWord.includes(queryWord) || queryWord.includes(titleWord) ||
+                  // 允许部分相似（如gumball vs gum）
+                  (queryWord.length > 4 && titleWord.length > 4 &&
+                   queryWord.substring(0, 4) === titleWord.substring(0, 4))
+                )
+              );
+
+              const wordMatchRatio = matchedWords.length / queryWords.length;
+              if (wordMatchRatio >= 0.5) {
+                console.log(`英文词汇匹配 (${matchedWords.length}/${queryWords.length}): "${result.title}" - 匹配词: [${matchedWords.join(', ')}]`);
+                return true;
+              }
+              return false;
+            });
+          } else {
+            // 中文查询：宽松匹配，保持现有行为
+            console.log('使用中文宽松匹配策略');
+            relevantMatches = allCandidates.filter(result => {
+              const title = result.title.toLowerCase();
+              const normalizedQuery = queryTitle.replace(/[^\w\u4e00-\u9fff]/g, '');
+              const normalizedTitle = title.replace(/[^\w\u4e00-\u9fff]/g, '');
+
+              // 包含匹配或50%相似度
+              if (normalizedTitle.includes(normalizedQuery) || normalizedQuery.includes(normalizedTitle)) {
+                console.log(`中文包含匹配: "${result.title}"`);
+                return true;
+              }
+
+              const commonChars = Array.from(normalizedQuery).filter(char => normalizedTitle.includes(char)).length;
+              const similarity = commonChars / normalizedQuery.length;
+              if (similarity >= 0.5) {
+                console.log(`中文相似匹配 (${(similarity*100).toFixed(1)}%): "${result.title}"`);
+                return true;
+              }
+              return false;
+            });
+          }
+
+          console.log(`匹配结果: ${relevantMatches.length}/${allCandidates.length}`);
+
+          const maxResults = isEnglishQuery ? 5 : 20; // 英文更严格控制结果数
+          if (relevantMatches.length > 0 && relevantMatches.length <= maxResults) {
+            finalResults = Array.from(
+              new Map(relevantMatches.map(item => [`${item.source}-${item.id}`, item])).values()
+            );
+          } else {
+            console.log('没有找到合理的匹配，返回空结果');
+            finalResults = [];
+          }
+        }
           
         console.log(`智能搜索完成，最终返回 ${finalResults.length} 个结果`);
         setAvailableSources(finalResults);
@@ -1735,16 +1984,66 @@ function PlayPageClient() {
     initSkipConfig();
   }, []);
 
-  // 处理换源
+  // 🚀 优化的换源处理（防连续点击）
   const handleSourceChange = async (
     newSource: string,
     newId: string,
     newTitle: string
   ) => {
     try {
+      // 防止连续点击换源
+      if (isSourceChangingRef.current) {
+        console.log('⏸️ 正在换源中，忽略重复点击');
+        return;
+      }
+
+      // 🚀 设置换源标识，防止useEffect重复处理弹幕
+      isSourceChangingRef.current = true;
+
       // 显示换源加载状态
       setVideoLoadingStage('sourceChanging');
       setIsVideoLoading(true);
+
+      // 🚀 立即重置弹幕相关状态，避免残留
+      lastDanmuLoadKeyRef.current = '';
+      danmuLoadingRef.current = false;
+
+      // 清除弹幕操作定时器
+      if (danmuOperationTimeoutRef.current) {
+        clearTimeout(danmuOperationTimeoutRef.current);
+        danmuOperationTimeoutRef.current = null;
+      }
+      if (episodeSwitchTimeoutRef.current) {
+        clearTimeout(episodeSwitchTimeoutRef.current);
+        episodeSwitchTimeoutRef.current = null;
+      }
+
+      // 🚀 正确地清空弹幕状态（基于ArtPlayer插件API）
+      if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
+        const plugin = artPlayerRef.current.plugins.artplayerPluginDanmuku;
+
+        try {
+          // 🚀 正确清空弹幕：先reset回收DOM，再load清空队列
+          if (typeof plugin.reset === 'function') {
+            plugin.reset(); // 立即回收所有正在显示的弹幕DOM
+          }
+
+          if (typeof plugin.load === 'function') {
+            // 关键：load()不传参数会触发清空逻辑（danmuku === undefined）
+            plugin.load();
+            console.log('✅ 已完全清空弹幕队列');
+          }
+
+          // 然后隐藏弹幕层
+          if (typeof plugin.hide === 'function') {
+            plugin.hide();
+          }
+
+          console.log('🧹 换源时已清空旧弹幕数据');
+        } catch (error) {
+          console.warn('清空弹幕时出错，但继续换源:', error);
+        }
+      }
 
       // 记录当前播放进度（仅在同一集数切换时恢复）
       const currentPlayTime = artPlayerRef.current?.currentTime || 0;
@@ -1818,7 +2117,78 @@ function PlayPageClient() {
       setCurrentId(newId);
       setDetail(newDetail);
       setCurrentEpisodeIndex(targetIndex);
+
+      // 🚀 换源完成后，优化弹幕加载流程
+      setTimeout(async () => {
+        isSourceChangingRef.current = false; // 重置换源标识
+
+        if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku && externalDanmuEnabledRef.current) {
+          console.log('🔄 换源完成，开始优化弹幕加载...');
+
+          // 确保状态完全重置
+          lastDanmuLoadKeyRef.current = '';
+          danmuLoadingRef.current = false;
+
+          try {
+            const startTime = performance.now();
+            const danmuData = await loadExternalDanmu();
+
+            if (danmuData.length > 0 && artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
+              const plugin = artPlayerRef.current.plugins.artplayerPluginDanmuku;
+
+              // 🚀 确保在加载新弹幕前完全清空旧弹幕
+              plugin.reset(); // 立即回收所有正在显示的弹幕DOM
+              plugin.load(); // 不传参数，完全清空队列
+              console.log('🧹 换源后已清空旧弹幕，准备加载新弹幕');
+
+              // 🚀 优化大量弹幕的加载：分批处理，减少阻塞
+              if (danmuData.length > 1000) {
+                console.log(`📊 检测到大量弹幕 (${danmuData.length}条)，启用分批加载`);
+
+                // 先加载前500条，快速显示
+                const firstBatch = danmuData.slice(0, 500);
+                plugin.load(firstBatch);
+
+                // 剩余弹幕分批异步加载，避免阻塞
+                const remainingBatches = [];
+                for (let i = 500; i < danmuData.length; i += 300) {
+                  remainingBatches.push(danmuData.slice(i, i + 300));
+                }
+
+                // 使用requestIdleCallback分批加载剩余弹幕
+                remainingBatches.forEach((batch, index) => {
+                  setTimeout(() => {
+                    if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
+                      // 将批次弹幕追加到现有队列
+                      batch.forEach(danmu => {
+                        plugin.emit(danmu).catch(console.warn);
+                      });
+                    }
+                  }, (index + 1) * 100); // 每100ms加载一批
+                });
+
+                console.log(`⚡ 分批加载完成: 首批${firstBatch.length}条 + ${remainingBatches.length}个后续批次`);
+              } else {
+                // 弹幕数量较少，正常加载
+                plugin.load(danmuData);
+                console.log(`✅ 换源后弹幕加载完成: ${danmuData.length} 条`);
+              }
+
+              const loadTime = performance.now() - startTime;
+              console.log(`⏱️ 弹幕加载耗时: ${loadTime.toFixed(2)}ms`);
+            } else {
+              console.log('📭 换源后没有弹幕数据');
+            }
+          } catch (error) {
+            console.error('❌ 换源后弹幕加载失败:', error);
+          }
+        }
+      }, 1000); // 减少到1秒延迟，加快响应
+
     } catch (err) {
+      // 重置换源标识
+      isSourceChangingRef.current = false;
+
       // 隐藏换源加载状态
       setIsVideoLoading(false);
       setError(err instanceof Error ? err.message : '换源失败');
@@ -1829,6 +2199,27 @@ function PlayPageClient() {
     document.addEventListener('keydown', handleKeyboardShortcuts);
     return () => {
       document.removeEventListener('keydown', handleKeyboardShortcuts);
+    };
+  }, []);
+
+  // 🚀 组件卸载时清理所有定时器和状态
+  useEffect(() => {
+    return () => {
+      // 清理所有定时器
+      if (danmuOperationTimeoutRef.current) {
+        clearTimeout(danmuOperationTimeoutRef.current);
+      }
+      if (episodeSwitchTimeoutRef.current) {
+        clearTimeout(episodeSwitchTimeoutRef.current);
+      }
+      if (sourceSwitchTimeoutRef.current) {
+        clearTimeout(sourceSwitchTimeoutRef.current);
+      }
+
+      // 重置状态
+      isSourceChangingRef.current = false;
+      switchPromiseRef.current = null;
+      pendingSwitchRef.current = null;
     };
   }, []);
 
@@ -1983,13 +2374,23 @@ function PlayPageClient() {
     }
 
     try {
+      // 获取现有播放记录以保持原始集数
+      const existingRecord = await getAllPlayRecords().then(records => {
+        const key = generateStorageKey(currentSourceRef.current, currentIdRef.current);
+        return records[key];
+      }).catch(() => null);
+
+      const currentTotalEpisodes = detailRef.current?.episodes.length || 1;
+
       await savePlayRecord(currentSourceRef.current, currentIdRef.current, {
         title: videoTitleRef.current,
         source_name: detailRef.current?.source_name || '',
         year: detailRef.current?.year,
         cover: detailRef.current?.poster || '',
         index: currentEpisodeIndexRef.current + 1, // 转换为1基索引
-        total_episodes: detailRef.current?.episodes.length || 1,
+        total_episodes: currentTotalEpisodes,
+        // 关键修复：设置原始集数，首次观看时使用当前集数，后续保持不变
+        original_episodes: existingRecord?.original_episodes || currentTotalEpisodes,
         play_time: Math.floor(currentTime),
         total_time: Math.floor(duration),
         save_time: Date.now(),
@@ -2182,24 +2583,73 @@ function PlayPageClient() {
       '投屏策略': isIOS || isSafari ? '🍎 AirPlay (WebKit)' : isChrome ? '📺 Chromecast (Cast API)' : '❌ 不支持投屏'
     });
 
-    // 优先使用ArtPlayer的switch方法，避免重建播放器
+    // 🚀 优化连续切换：防抖机制 + 资源管理
     if (artPlayerRef.current && !loading) {
       try {
-        // 🚀 优化：不在这里处理弹幕，让 useEffect 统一处理
-        // 保存当前弹幕状态，但不清空弹幕（避免闪烁）
+        // 清除之前的切换定时器
+        if (sourceSwitchTimeoutRef.current) {
+          clearTimeout(sourceSwitchTimeoutRef.current);
+          sourceSwitchTimeoutRef.current = null;
+        }
+
+        // 如果有正在进行的切换，先取消
+        if (switchPromiseRef.current) {
+          console.log('⏸️ 取消前一个切换操作，开始新的切换');
+          // ArtPlayer没有提供取消机制，但我们可以忽略旧的结果
+          switchPromiseRef.current = null;
+        }
+
+        // 保存弹幕状态
         if (artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
           danmuPluginStateRef.current = {
             isHide: artPlayerRef.current.plugins.artplayerPluginDanmuku.isHide,
             isStop: artPlayerRef.current.plugins.artplayerPluginDanmuku.isStop,
             option: artPlayerRef.current.plugins.artplayerPluginDanmuku.option
           };
-          console.log('🔄 已保存弹幕状态，准备切换视频');
         }
-        
-        // 使用ArtPlayer的switch方法切换URL
-        artPlayerRef.current.switch = videoUrl;
-        artPlayerRef.current.title = `${videoTitle} - 第${currentEpisodeIndex + 1}集`;
-        artPlayerRef.current.poster = videoCover;
+
+        // 🚀 关键修复：区分换源和切换集数
+        const isEpisodeChange = isEpisodeChangingRef.current;
+        const currentTime = artPlayerRef.current.currentTime || 0;
+
+        let switchPromise: Promise<any>;
+        if (isEpisodeChange) {
+          console.log(`🎯 开始切换集数: ${videoUrl} (重置播放时间到0)`);
+          // 切换集数时重置播放时间到0
+          switchPromise = artPlayerRef.current.switchUrl(videoUrl);
+        } else {
+          console.log(`🎯 开始切换源: ${videoUrl} (保持进度: ${currentTime.toFixed(2)}s)`);
+          // 换源时保持播放进度
+          switchPromise = artPlayerRef.current.switchQuality(videoUrl);
+        }
+
+        // 创建切换Promise
+        switchPromise = switchPromise.then(() => {
+          // 只有当前Promise还是活跃的才执行后续操作
+          if (switchPromiseRef.current === switchPromise) {
+            artPlayerRef.current.title = `${videoTitle} - 第${currentEpisodeIndex + 1}集`;
+            artPlayerRef.current.poster = videoCover;
+            console.log('✅ 源切换完成');
+
+            // 🔥 重置集数切换标识
+            if (isEpisodeChange) {
+              isEpisodeChangingRef.current = false;
+              console.log('🎯 集数切换完成，重置标识');
+            }
+          }
+        }).catch((error: any) => {
+          if (switchPromiseRef.current === switchPromise) {
+            console.warn('⚠️ 源切换失败，将重建播放器:', error);
+            // 重置集数切换标识
+            if (isEpisodeChange) {
+              isEpisodeChangingRef.current = false;
+            }
+            throw error; // 让外层catch处理
+          }
+        });
+
+        switchPromiseRef.current = switchPromise;
+        await switchPromise;
         
         if (artPlayerRef.current?.video) {
           ensureVideoSource(
@@ -2214,6 +2664,8 @@ function PlayPageClient() {
         return;
       } catch (error) {
         console.warn('Switch方法失败，将重建播放器:', error);
+        // 重置集数切换标识
+        isEpisodeChangingRef.current = false;
         // 如果switch失败，清理播放器并重新创建
         cleanupPlayer();
       }
@@ -2364,6 +2816,32 @@ function PlayPageClient() {
 
             hls.on(Hls.Events.ERROR, function (event: any, data: any) {
               console.error('HLS Error:', event, data);
+
+              // v1.6.13 增强：处理片段解析错误（针对initPTS修复）
+              if (data.details === Hls.ErrorDetails.FRAG_PARSING_ERROR) {
+                console.log('片段解析错误，尝试重新加载...');
+                // 重新开始加载，利用v1.6.13的initPTS修复
+                hls.startLoad();
+                return;
+              }
+
+              // v1.6.13 增强：处理时间戳相关错误（直播回搜修复）
+              if (data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR &&
+                  data.err && data.err.message &&
+                  data.err.message.includes('timestamp')) {
+                console.log('时间戳错误，清理缓冲区并重新加载...');
+                try {
+                  // 清理缓冲区后重新开始，利用v1.6.13的时间戳包装修复
+                  const currentTime = video.currentTime;
+                  hls.trigger(Hls.Events.BUFFER_RESET, undefined);
+                  hls.startLoad(currentTime);
+                } catch (e) {
+                  console.warn('缓冲区重置失败:', e);
+                  hls.startLoad();
+                }
+                return;
+              }
+
               if (data.fatal) {
                 switch (data.type) {
                   case Hls.ErrorTypes.NETWORK_ERROR:
@@ -2604,9 +3082,15 @@ function PlayPageClient() {
                   return true
                 },
                 
-                // 🚀 激进性能优化的动态密度控制
+                // 🚀 优化的弹幕显示前检查（换源时性能优化）
                 beforeVisible: (danmu: any) => {
                   return new Promise<boolean>((resolve) => {
+                    // 换源期间快速拒绝弹幕显示，减少处理开销
+                    if (isSourceChangingRef.current) {
+                      resolve(false);
+                      return;
+                    }
+
                     // 🎯 动态弹幕密度控制 - 根据当前屏幕上的弹幕数量决定是否显示
                     const currentVisibleCount = document.querySelectorAll('.art-danmuku [data-state="emit"]').length;
                     const maxConcurrentDanmu = devicePerformance === 'high' ? 60 :
@@ -2742,18 +3226,19 @@ function PlayPageClient() {
         // 添加弹幕插件按钮选择性隐藏CSS
         const optimizeDanmukuControlsCSS = () => {
           if (document.getElementById('danmuku-controls-optimize')) return;
-          
+
           const style = document.createElement('style');
           style.id = 'danmuku-controls-optimize';
           style.textContent = `
-            /* 只显示弹幕配置按钮，隐藏开关按钮和发射器 */
+            /* 隐藏弹幕开关按钮和发射器 */
             .artplayer-plugin-danmuku .apd-toggle {
               display: none !important;
             }
-            
+
             .artplayer-plugin-danmuku .apd-emitter {
               display: none !important;
             }
+
             
             /* 弹幕配置面板优化 - 修复全屏模式下点击问题 */
             .artplayer-plugin-danmuku .apd-config {
@@ -2811,35 +3296,31 @@ function PlayPageClient() {
               const style = document.createElement('style');
               style.id = 'danmaku-drag-fix';
               style.textContent = `
-                /* 仅在拖拽状态时禁用弹幕hover */
-                .artplayer[data-dragging="true"] .artplayer-plugin-danmuku .apd-config:hover .apd-config-panel,
-                .artplayer[data-dragging="true"] .artplayer-plugin-danmuku .apd-style:hover .apd-style-panel {
-                  opacity: 0 !important;
-                  pointer-events: none !important;
-                }
-                
-                /* 核心修复：确保进度条在弹幕面板上方，或让面板不拦截进度条点击 */
-                .art-progress {
-                  position: relative;
-                  z-index: 999 !important;
-                }
-                
-                /* 弹幕面板pointer-events精确控制 - 只有内容区域可点击，面板背景不拦截 */
-                .artplayer-plugin-danmuku .apd-config-panel {
-                  pointer-events: none !important;
-                }
-                
-                .artplayer-plugin-danmuku .apd-style-panel {
-                  pointer-events: none !important;
-                }
-                
-                /* 只有内容区域可以接收点击事件 */
-                .artplayer-plugin-danmuku .apd-config-panel-inner,
-                .artplayer-plugin-danmuku .apd-style-panel-inner {
+                /* 🔧 修复长时间播放后弹幕菜单hover失效问题 */
+
+                /* 确保控制元素本身可以接收鼠标事件，恢复原生hover机制 */
+                .artplayer-plugin-danmuku .apd-config,
+                .artplayer-plugin-danmuku .apd-style {
                   pointer-events: auto !important;
                 }
-                
-                /* 面板内的具体控件可以点击 */
+
+                /* 简化：依赖全局CSS中的hover处理 */
+
+                /* 确保进度条层级足够高，避免被弹幕面板遮挡 */
+                .art-progress {
+                  position: relative;
+                  z-index: 1000 !important;
+                }
+
+                /* 面板背景在非hover状态下不拦截事件，但允许hover检测 */
+                .artplayer-plugin-danmuku .apd-config-panel:not(:hover),
+                .artplayer-plugin-danmuku .apd-style-panel:not(:hover) {
+                  pointer-events: none;
+                }
+
+                /* 面板内的具体控件始终可以交互 */
+                .artplayer-plugin-danmuku .apd-config-panel-inner,
+                .artplayer-plugin-danmuku .apd-style-panel-inner,
                 .artplayer-plugin-danmuku .apd-config-panel .apd-mode,
                 .artplayer-plugin-danmuku .apd-config-panel .apd-other,
                 .artplayer-plugin-danmuku .apd-config-panel .apd-slider,
@@ -2896,27 +3377,79 @@ function PlayPageClient() {
             
             // 应用CSS
             addPrecisionCSS();
-            
+
+            // 🔄 添加定期重置机制，防止长时间播放后状态污染
+            const danmakuResetInterval = setInterval(() => {
+              if (!artPlayerRef.current?.plugins?.artplayerPluginDanmuku) {
+                clearInterval(danmakuResetInterval);
+                return;
+              }
+
+              try {
+                // 重置弹幕控件和面板状态
+                const controls = document.querySelectorAll('.artplayer-plugin-danmuku .apd-config, .artplayer-plugin-danmuku .apd-style') as NodeListOf<HTMLElement>;
+                const panels = document.querySelectorAll('.artplayer-plugin-danmuku .apd-config-panel, .artplayer-plugin-danmuku .apd-style-panel') as NodeListOf<HTMLElement>;
+
+                // 强制重置控制元素的事件接收能力
+                controls.forEach(control => {
+                  if (control.style.pointerEvents === 'none') {
+                    control.style.pointerEvents = 'auto';
+                  }
+                });
+
+                // 重置面板状态，但不影响当前hover状态
+                panels.forEach(panel => {
+                  if (!panel.matches(':hover') && panel.style.opacity === '0') {
+                    panel.style.opacity = '';
+                    panel.style.pointerEvents = '';
+                    panel.style.visibility = '';
+                  }
+                });
+
+                console.log('🔄 弹幕菜单hover状态已重置');
+              } catch (error) {
+                console.warn('弹幕状态重置失败:', error);
+              }
+            }, 300000); // 每5分钟重置一次
+
+            // 🚀 立即恢复hover状态（修复当前可能已存在的问题）
+            const immediateRestore = () => {
+              const controls = document.querySelectorAll('.artplayer-plugin-danmuku .apd-config, .artplayer-plugin-danmuku .apd-style') as NodeListOf<HTMLElement>;
+              controls.forEach(control => {
+                control.style.pointerEvents = 'auto';
+              });
+              console.log('🚀 弹幕菜单hover状态已立即恢复');
+            };
+
+            // 立即执行一次恢复
+            setTimeout(immediateRestore, 100);
+
           }, 1500); // 等待弹幕插件加载
         };
-        
+
         // 启用精确修复
         fixDanmakuProgressConflict();
 
         // 移动端弹幕配置按钮点击切换支持 - 基于ArtPlayer设置按钮原理
         const addMobileDanmakuToggle = () => {
           const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-          
+
           setTimeout(() => {
             const configButton = document.querySelector('.artplayer-plugin-danmuku .apd-config');
             const configPanel = document.querySelector('.artplayer-plugin-danmuku .apd-config-panel');
-            
+
             if (!configButton || !configPanel) {
               console.warn('弹幕配置按钮或面板未找到');
               return;
             }
-            
+
             console.log('设备类型:', isMobile ? '移动端' : '桌面端');
+
+            // 桌面端：简化处理，依赖CSS hover，移除复杂的JavaScript事件
+            if (!isMobile) {
+              console.log('桌面端：使用CSS原生hover，避免JavaScript事件冲突');
+              return;
+            }
             
             if (isMobile) {
               // 移动端：添加点击切换支持 + 持久位置修正
@@ -3001,77 +3534,6 @@ function PlayPageClient() {
               });
 
               console.log('移动端弹幕配置切换功能已激活');
-            } else {
-              // 桌面端：使用hover延迟交互，与移动端保持一致
-              console.log('为桌面端添加弹幕配置按钮hover延迟交互功能');
-
-              let isConfigVisible = false;
-              let showTimer: NodeJS.Timeout | null = null;
-              let hideTimer: NodeJS.Timeout | null = null;
-
-              const showPanel = () => {
-                if (hideTimer) {
-                  clearTimeout(hideTimer);
-                  hideTimer = null;
-                }
-
-                if (!isConfigVisible) {
-                  isConfigVisible = true;
-                  (configPanel as HTMLElement).style.setProperty('display', 'block', 'important');
-                  // 添加show类来触发动画
-                  setTimeout(() => {
-                    (configPanel as HTMLElement).classList.add('show');
-                  }, 10);
-                  console.log('桌面端弹幕配置面板：显示');
-                }
-              };
-
-              const hidePanel = () => {
-                if (showTimer) {
-                  clearTimeout(showTimer);
-                  showTimer = null;
-                }
-
-                if (isConfigVisible) {
-                  isConfigVisible = false;
-                  (configPanel as HTMLElement).classList.remove('show');
-                  // 等待动画完成后隐藏
-                  setTimeout(() => {
-                    (configPanel as HTMLElement).style.setProperty('display', 'none', 'important');
-                  }, 200);
-                  console.log('桌面端弹幕配置面板：隐藏');
-                }
-              };
-
-              // 鼠标进入按钮或面板区域
-              const handleMouseEnter = () => {
-                if (hideTimer) {
-                  clearTimeout(hideTimer);
-                  hideTimer = null;
-                }
-
-                showTimer = setTimeout(showPanel, 300); // 300ms延迟显示
-              };
-
-              // 鼠标离开按钮或面板区域
-              const handleMouseLeave = () => {
-                if (showTimer) {
-                  clearTimeout(showTimer);
-                  showTimer = null;
-                }
-
-                hideTimer = setTimeout(hidePanel, 500); // 500ms延迟隐藏
-              };
-
-              // 为按钮添加hover事件
-              configButton.addEventListener('mouseenter', handleMouseEnter);
-              configButton.addEventListener('mouseleave', handleMouseLeave);
-
-              // 为面板添加hover事件
-              configPanel.addEventListener('mouseenter', handleMouseEnter);
-              configPanel.addEventListener('mouseleave', handleMouseLeave);
-
-              console.log('桌面端弹幕配置hover延迟交互功能已激活');
             }
           }, 2000); // 延迟2秒确保弹幕插件完全初始化
         };
@@ -3370,6 +3832,12 @@ function PlayPageClient() {
 
         // 隐藏换源加载状态
         setIsVideoLoading(false);
+
+        // 🔥 重置集数切换标识（播放器成功创建后）
+        if (isEpisodeChangingRef.current) {
+          isEpisodeChangingRef.current = false;
+          console.log('🎯 播放器创建完成，重置集数切换标识');
+        }
       });
 
       // 监听播放器错误
@@ -3461,6 +3929,8 @@ function PlayPageClient() {
       }
     } catch (err) {
       console.error('创建播放器失败:', err);
+      // 重置集数切换标识
+      isEpisodeChangingRef.current = false;
       setError('播放器初始化失败');
     }
     }; // 结束 initPlayer 函数

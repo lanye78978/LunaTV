@@ -289,7 +289,19 @@ export class DbManager {
       avgPlaysPerUser: 0,
       userStats: [],
       topSources: [],
-      dailyStats: []
+      dailyStats: [],
+      // 新增：用户注册统计
+      registrationStats: {
+        todayNewUsers: 0,
+        totalRegisteredUsers: 0,
+        registrationTrend: [],
+      },
+      // 新增：用户活跃度统计
+      activeUsers: {
+        daily: 0,
+        weekly: 0,
+        monthly: 0,
+      },
     };
   }
 
@@ -327,6 +339,16 @@ export class DbManager {
   ): Promise<void> {
     if (typeof (this.storage as any).updatePlayStatistics === 'function') {
       await (this.storage as any).updatePlayStatistics(_userName, _source, _id, _watchTime);
+    }
+  }
+
+  async updateUserLoginStats(
+    userName: string,
+    loginTime: number,
+    isFirstLogin?: boolean
+  ): Promise<void> {
+    if (typeof (this.storage as any).updateUserLoginStats === 'function') {
+      await (this.storage as any).updateUserLoginStats(userName, loginTime, isFirstLogin);
     }
   }
 
